@@ -24,8 +24,10 @@ import ssl
 import sys
 import threading
 import time
+import traceback
 import urllib
 import urllib2
+import urllib3.exceptions
 import urlparse
 from xml.sax.saxutils import escape
 
@@ -44,6 +46,9 @@ try:
     from youtube_dl.utils import sanitize_filename
 except ImportError:
     youtube_dl = None
+
+import web_crawler
+from web_crawler import WebCrawler
 
 # Format of displayed tags
 TAG_FMT = '#%s'
@@ -460,11 +465,12 @@ class TumblrBackup:
 <meta charset=%s>
 <title>%s</title>
 <link rel=stylesheet href=%s>
+<link rel=icon href=%s%s/%s>
 
 <body%s>
 
 <header>
-''' % (encoding, self.title, css_rel, body_class)
+''' % (encoding, self.title, css_rel, root_rel, theme_dir, split(glob(path_to(theme_dir, avatar_base + '.*'))[0])[1], body_class)
         if avatar:
             f = glob(path_to(theme_dir, avatar_base + '.*'))
             if f:
@@ -649,7 +655,9 @@ class TumblrPost:
         self.tags = post['tags']
         self.note_count = post.get('note_count', 0)
         self.reblogged_from = post.get('reblogged_from_url')
+        self.reblogged_from_name = post.get('reblogged_from_name')
         self.reblogged_root = post.get('reblogged_root_url')
+        self.reblogged_root_name = post.get('reblogged_root_name')
         self.source_title = post.get('source_title', '')
         self.source_url = post.get('source_url', '')
         if options.request:
@@ -788,17 +796,19 @@ class TumblrPost:
         filetmpl = u'%(id)s_%(uploader_id)s_%(title)s.%(ext)s'
         ydl_options = {
             'outtmpl': join(self.media_folder, filetmpl),
-            'quiet': True, 
-            'restrictfilenames': True, 
+            'quiet': True,
+            'restrictfilenames': True,
             'noplaylist': True,
             'continuedl': True,
             'nooverwrites': True,
-            'retries': 3000,		
+            'retries': 3000,
             'fragment_retries': 3000,
             'ignoreerrors': True
         }
-        if options.cookiefile:
-            ydl_options['cookiefile'] = options.cookiefile
+
+        if options.cookies:
+            ydl_options['cookiefile'] = options.cookies
+
         ydl = youtube_dl.YoutubeDL(ydl_options)
         ydl.add_default_info_extractors()
         try:
@@ -954,28 +964,64 @@ class TumblrPost:
         post += u'<header>\n'
         if options.likes:
             post += u'<p><a href=\"http://{0}.tumblr.com/\" class=\"tumblr_blog\">{0}</a>:</p>\n'.format(self.creator)
-        post += u'<p><time datetime=%s>%s</time>\n' % (self.isodate, strftime('%x %X', self.tm))
-        post += u'<a class=llink href=%s%s/%s>¶</a>\n' % (save_dir, post_dir, self.llink)
-        post += u'<a href=%s>●</a>\n' % self.shorturl
-        if self.reblogged_from and self.reblogged_from != self.reblogged_root:
-            post += u'<a href=%s>⬀</a>\n' % self.reblogged_from
-        if self.reblogged_root:
-            post += u'<a href=%s>⬈</a>\n' % self.reblogged_root
         post += '</header>\n'
         if self.title:
             post += u'<h2>%s</h2>\n' % self.title
         post += self.content
         foot = []
         if self.tags:
-            foot.append(u''.join(self.tag_link(t) for t in self.tags))
-        if self.note_count:
-            foot.append(u'%d note%s' % (self.note_count, 's'[self.note_count == 1:]))
+            foot.append(u', '.join(self.tag_link(t) for t in self.tags))
         if self.source_title and self.source_url:
-            foot.append(u'<a title=Source href=%s>%s</a>' %
+            foot.append(u'source: <a class=footer title=Source href=%s>%s</a>' %
                 (self.source_url, self.source_title)
             )
+        if self.reblogged_from and self.reblogged_from != self.reblogged_root:
+            foot.append(u'via <a class=footer href=%s>%s</a>\n' % (self.reblogged_from, self.reblogged_from_name))
+        if self.reblogged_root:
+            foot.append(u'from <a class=footer href=%s>%s</a>\n' % (self.reblogged_root, self.reblogged_root_name))
+
+        foot.append(u'<a class=footer href=%s%s/%s><time datetime=%s>%s</time></a>' % (save_dir, post_dir, self.llink, self.isodate, strftime('%A, %B %-d, %Y %-I:%M%p', self.tm)))
+        foot.append(u'<a class=footer href=%s>permalink</a>\n' % self.url)
+
+        notes = []
+
+        if options.save_notes and self.note_count > 0:
+            notes.append(u'<details><summary>%d note%s</summary>\n' % (self.note_count, 's'[self.note_count == 1:]))
+            notes.append(u'<ol class="notes">')
+
+            crawler = WebCrawler(options.cookies)
+
+            delay = 1
+            while True:
+                try:
+                    notes.append(crawler.get_notes(self.url))
+                except urllib3.exceptions.ProtocolError as pe:
+                    if pe.args[0] != 'Connection aborted.':
+                        raise
+                except urllib3.exceptions.MaxRetryError as e:
+                    # Typically happens due to an interrrupt
+                    # This seems to happen on all threads at once, so silence it
+                    sys.exit(EXIT_INTERRUPT)
+                except urllib2.HTTPError as e:
+                    print 'HTTP Error %d getting notes for post %s.' % (e.code, self.ident)
+                    print 'URL was: %s' % crawler.lasturl
+                    if e.code == 429:
+                        print 'Retrying... (delay = %d)' % delay
+                        time.sleep(delay)
+                        delay *= 2
+                        continue
+                except:
+                    print 'Error getting notes for post %s:' % self.ident
+                    traceback.print_exc()
+
+                break
+
+            notes.append(u'</ol></details>')
+        else:
+            notes.append(u'<summary>0 notes</summary>\n')
+
         if foot:
-            post += u'\n<footer>%s</footer>' % u' — '.join(foot)
+            post += u'\n<footer>%s %s</footer>' % (u' | \n'.join(foot), u'\n'.join(notes))
         post += '\n</article>\n'
         return post
 
@@ -985,7 +1031,7 @@ class TumblrPost:
         if not TAGLINK_FMT:
             return tag_disp + ' '
         url = TAGLINK_FMT % {'domain': blog_name, 'tag': urllib.quote(tag.encode('utf-8'))}
-        return u'<a href=%s>%s</a>\n' % (url, tag_disp)
+        return u'<a class=footer href=%s>%s</a>\n' % (url, tag_disp)
 
     def save_post(self):
         """saves this post locally"""
@@ -1134,7 +1180,7 @@ if __name__ == '__main__':
     parser.add_option('--save-video', action='store_true', help="save all video files")
     parser.add_option('--save-video-tumblr', action='store_true', help="save only Tumblr video files")
     parser.add_option('--save-audio', action='store_true', help="save audio files")
-    parser.add_option('--cookiefile', help="cookie file for youtube-dl")
+    parser.add_option('--save-notes', action='store_true', help="save a list of notes for each post")
     parser.add_option('-j', '--json', action='store_true',
         help="save the original JSON source"
     )
@@ -1194,6 +1240,9 @@ if __name__ == '__main__':
     parser.add_option('-S', '--no-ssl-verify', action='store_true',
         help="ignore SSL verification errors"
     )
+    parser.add_option('--cookies', type='string',
+        help="Netscape cookie file (needed for youtube-dl and notes on blogs marked explicit)"
+    )
     options, args = parser.parse_args()
 
     if options.auto is not None and options.auto != time.localtime().tm_hour:
@@ -1223,6 +1272,11 @@ if __name__ == '__main__':
         parser.error("--exif: module 'pyexif2' is not installed")
     if options.save_video and not youtube_dl:
         parser.error("--save-video: module 'youtube_dl' is not installed")
+    if options.save_notes:
+        if not web_crawler.bs4:
+            parser.error("--save-notes: module 'bs4' is not installed")
+    if options.cookies and not os.access(options.cookies, os.R_OK):
+        parser.error("--cookies: file cannot be read")
 
     tb = TumblrBackup()
     try:
